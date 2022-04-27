@@ -40,6 +40,11 @@
 #include <spoe_types.h>
 #include <spop_functions.h>
 
+#include <spoa_pam.h>
+#include <spoa_base64.h>
+
+#include <security/pam_appl.h>
+
 #define DEFAULT_PORT       12345
 #define CONNECTION_BACKLOG 10
 #define NUM_WORKERS        10
@@ -98,6 +103,8 @@ struct spoe_frame {
 	bool                 hcheck;     /* true is the CONNECT frame is a healthcheck */
 	bool                 fragmented; /* true if the frame is fragmented */
 	int                  ip_score;   /* -1 if unset, else between 0 and 100 */
+	int                  header_valid;
+	int                  authenticated;
 
 	struct event         process_frame_event;
 	struct worker       *worker;
@@ -200,32 +207,70 @@ static void release_frame(struct spoe_frame *);
 static void release_client(struct client *);
 
 static void
-check_ipv4_reputation(struct spoe_frame *frame, struct in_addr *ipv4)
+check_authorization_header(struct spoe_frame *frame, struct chunk *auth_header)
 {
-	char str[INET_ADDRSTRLEN];
 
-	if (inet_ntop(AF_INET, ipv4, str, INET_ADDRSTRLEN) == NULL)
-		return;
+	DEBUG(frame->worker, "Auth header is %.*s", ((int) auth_header->len) - 6, (auth_header->ptr + 6));
 
-	frame->ip_score = random() % 100;
+	char *b64_encoded_pair = auth_header->ptr + 6; // Skip "Basic "
+	char *username_password_pair = spoa_base64_decode(b64_encoded_pair);
 
-	DEBUG(frame->worker, "IP score for %.*s is %d",
-	      INET_ADDRSTRLEN, str, frame->ip_score);
+	DEBUG(frame->worker, "Decuded Basic Auth: %.*s", (int) strlen(username_password_pair), username_password_pair);
+
+	char *t = username_password_pair;
+	char *username = username_password_pair;
+	char *password = NULL;
+	while (*t != '\0') {
+		if (*t == ':') {
+			*t = '\0';
+			password = t + 1;
+			break;
+		}
+		++t;
+	}
+
+	size_t username_len = strlen(username);
+	size_t password_len = strlen(password);
+
+	DEBUG(frame->worker, "Username: %.*s", (int) username_len, username);
+	DEBUG(frame->worker, "Password: %.*s", (int) password_len, password);
+
+	int pam_retval = authenticate_system(username, password);
+	
+	frame->authenticated = (pam_retval == PAM_SUCCESS);
+
+	DEBUG(frame->worker, "authenticated: %u", frame->authenticated);
+
+	free(username_password_pair);
 }
 
-static void
-check_ipv6_reputation(struct spoe_frame *frame, struct in6_addr *ipv6)
-{
-	char str[INET6_ADDRSTRLEN];
+// static void
+// check_ipv4_reputation(struct spoe_frame *frame, struct in_addr *ipv4)
+// {
+// 	char str[INET_ADDRSTRLEN];
 
-	if (inet_ntop(AF_INET6, ipv6, str, INET6_ADDRSTRLEN) == NULL)
-		return;
+// 	if (inet_ntop(AF_INET, ipv4, str, INET_ADDRSTRLEN) == NULL)
+// 		return;
 
-	frame->ip_score = random() % 100;
+// 	frame->ip_score = random() % 100;
 
-	DEBUG(frame->worker, "IP score for %.*s is %d",
-	      INET6_ADDRSTRLEN, str, frame->ip_score);
-}
+// 	DEBUG(frame->worker, "IP score for %.*s is %d",
+// 	      INET_ADDRSTRLEN, str, frame->ip_score);
+// }
+
+// static void
+// check_ipv6_reputation(struct spoe_frame *frame, struct in6_addr *ipv6)
+// {
+// 	char str[INET6_ADDRSTRLEN];
+
+// 	if (inet_ntop(AF_INET6, ipv6, str, INET6_ADDRSTRLEN) == NULL)
+// 		return;
+
+// 	frame->ip_score = random() % 100;
+
+// 	DEBUG(frame->worker, "IP score for %.*s is %d",
+// 	      INET6_ADDRSTRLEN, str, frame->ip_score);
+// }
 
 
 /* Check the protocol version. It returns -1 if an error occurred, the number of
@@ -1328,7 +1373,28 @@ process_frame_cb(evutil_socket_t fd, short events, void *arg)
 
 		nbargs = (unsigned char)*p++;      /* Get the number of arguments */
 		frame->offset = (p - frame->buf);  /* Save index to handle errors and skip args */
-		if (!memcmp(str, "check-client-ip", sz)) {
+		// if (!memcmp(str, "check-client-ip", sz)) {
+		// 	
+		// 	union spoe_data data;
+		// 	enum spoe_data_type type;
+
+		// 	if (nbargs != 1)
+		// 		goto skip_message;
+
+		// 	if (spoe_decode_buffer(&p, end, &str, &sz) == -1)
+		// 		goto stop_processing;
+		// 	if (spoe_decode_data(&p, end, &data, &type) == -1)
+		// 		goto skip_message;
+		// 	frame->worker->nbframes++;
+		// 	if (type == SPOE_DATA_T_IPV4)
+		// 		check_ipv4_reputation(frame, &data.ipv4);
+		// 	if (type == SPOE_DATA_T_IPV6)
+		// 		check_ipv6_reputation(frame, &data.ipv6);
+		// }
+		if (!memcmp(str, "check-authorization", sz)) {
+
+			DEBUG(frame->worker, "entered check-authorization");
+			
 			union spoe_data data;
 			enum spoe_data_type type;
 
@@ -1340,13 +1406,20 @@ process_frame_cb(evutil_socket_t fd, short events, void *arg)
 			if (spoe_decode_data(&p, end, &data, &type) == -1)
 				goto skip_message;
 			frame->worker->nbframes++;
-			if (type == SPOE_DATA_T_IPV4)
-				check_ipv4_reputation(frame, &data.ipv4);
-			if (type == SPOE_DATA_T_IPV6)
-				check_ipv6_reputation(frame, &data.ipv6);
+
+			DEBUG(frame->worker, "spoe data type %d", type);
+			frame->header_valid = 0;
+
+			if (type == SPOE_DATA_T_STR) {
+				frame->header_valid = 1;
+				DEBUG(frame->worker, "spoe data t is str");
+				check_authorization_header(frame, &data.chk);
+			}
+				
 		}
 		else {
 		  skip_message:
+		  	DEBUG(frame->worker, "skiped message");
 			p = frame->buf + frame->offset; /* Restore index */
 
 			while (nbargs-- > 0) {
@@ -1370,18 +1443,39 @@ process_frame_cb(evutil_socket_t fd, short events, void *arg)
 	p   = frame->buf + ret;
 	end = frame->buf+max_frame_size;
 
-	if (frame->ip_score != -1) {
-		DEBUG(frame->worker, "Add action : set variable ip_score=%u",
-		      frame->ip_score);
+	// if (frame->ip_score != -1) {
+	// 	DEBUG(frame->worker, "Add action : set variable ip_score=%u",
+	// 	      frame->ip_score);
 
-		*p++ = SPOE_ACT_T_SET_VAR;                     /* Action type */
-		*p++ = 3;                                      /* Number of args */
-		*p++ = SPOE_SCOPE_SESS;                        /* Arg 1: the scope */
-		spoe_encode_buffer("ip_score", 8, &p, end);    /* Arg 2: variable name */
-		*p++ = SPOE_DATA_T_UINT32;
-		encode_varint(frame->ip_score, &p, end); /* Arg 3: variable value */
-		frame->len = (p - frame->buf);
-	}
+	// 	*p++ = SPOE_ACT_T_SET_VAR;                     /* Action type */
+	// 	*p++ = 3;                                      /* Number of args */
+	// 	*p++ = SPOE_SCOPE_SESS;                        /* Arg 1: the scope */
+	// 	spoe_encode_buffer("ip_score", 8, &p, end);    /* Arg 2: variable name */
+	// 	*p++ = SPOE_DATA_T_UINT32;
+	// 	encode_varint(frame->ip_score, &p, end); /* Arg 3: variable value */
+	// 	frame->len = (p - frame->buf);
+	// }
+
+	DEBUG(frame->worker, "Add action : set variable header_valid=%u", frame->header_valid);
+
+	*p++ = SPOE_ACT_T_SET_VAR; // Action type
+	*p++ = 3; // Number of args
+	*p++ = SPOE_SCOPE_SESS; // Arg 1: scope
+	spoe_encode_buffer("header_valid", 12, &p, end); // Arg 2: variable name
+	*p++ = SPOE_DATA_T_UINT32;
+	encode_varint(frame->header_valid, &p, end); // Arg 3: variable value
+	frame->len = (p - frame->buf);
+
+	DEBUG(frame->worker, "Add action : set variable authenticated=%u", frame->authenticated);
+
+	*p++ = SPOE_ACT_T_SET_VAR; // Action type
+	*p++ = 3; // Number of args
+	*p++ = SPOE_SCOPE_SESS; // Arg 1: scope
+	spoe_encode_buffer("authenticated", 13, &p, end); // Arg 2: variable name
+	*p++ = SPOE_DATA_T_UINT32;
+	encode_varint(frame->authenticated, &p, end); // Arg 3: variable value
+	frame->len = (p - frame->buf);
+
 	write_frame(NULL, frame);
 }
 

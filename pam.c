@@ -6,6 +6,10 @@
 
 #include <spoa_pam.h>
 
+#ifndef SPOA_PAM_SERVICE_NAME
+#define SPOA_PAM_SERVICE_NAME "fdt-spoa-pam"
+#endif
+
 int function_conversation(int num_msg, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr)
 {
     *resp = (struct pam_response *) appdata_ptr;
@@ -20,8 +24,9 @@ int authenticate_system(const char *username, const char *password)
     pam_handle_t *local_auth_handle = NULL;
 
     int retval;
+    int pam_end_retval;
     // TODO: custom pam service name su -> sth?
-    retval = pam_start("fdt-pam-test-client", username, &local_conversation, &local_auth_handle); 
+    retval = pam_start(SPOA_PAM_SERVICE_NAME, username, &local_conversation, &local_auth_handle); 
     
     if (retval != PAM_SUCCESS)
     {
@@ -32,8 +37,6 @@ int authenticate_system(const char *username, const char *password)
     reply[0].resp = strdup(password);
     reply[0].resp_retcode = 0;
     retval = pam_authenticate(local_auth_handle, 0);
-
-    int pam_auth_retval = retval;
 
     if (retval != PAM_SUCCESS)
     {
@@ -46,14 +49,15 @@ int authenticate_system(const char *username, const char *password)
     }
 
 pam_cleanup:
-    retval = pam_end(local_auth_handle, retval);
 
-    if (retval != PAM_SUCCESS)
+    pam_end_retval = pam_end(local_auth_handle, retval);
+
+    if (pam_end_retval != PAM_SUCCESS)
     {
         perror("Error when pam_end(): ");
     }
 
-    return pam_auth_retval;
+    return retval;
 }
 
 // int main(int argc, char **argv)
