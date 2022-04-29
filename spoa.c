@@ -105,6 +105,7 @@ struct spoe_frame {
 	int                  ip_score;   /* -1 if unset, else between 0 and 100 */
 	int                  header_valid;
 	int                  authenticated;
+	char                *username_password_pair;
 
 	struct event         process_frame_event;
 	struct worker       *worker;
@@ -218,6 +219,7 @@ check_authorization_header(struct spoe_frame *frame, struct chunk *auth_header)
 	DEBUG(frame->worker, "Decuded Basic Auth: %.*s", (int) strlen(username_password_pair), username_password_pair);
 
 	char *t = username_password_pair;
+	frame->username_password_pair = username_password_pair;
 	char *username = username_password_pair;
 	char *password = NULL;
 	while (*t != '\0') {
@@ -240,8 +242,6 @@ check_authorization_header(struct spoe_frame *frame, struct chunk *auth_header)
 	frame->authenticated = (pam_retval == PAM_SUCCESS);
 
 	DEBUG(frame->worker, "authenticated: %u", frame->authenticated);
-
-	free(username_password_pair);
 }
 
 // static void
@@ -1475,6 +1475,18 @@ process_frame_cb(evutil_socket_t fd, short events, void *arg)
 	*p++ = SPOE_DATA_T_UINT32;
 	encode_varint(frame->authenticated, &p, end); // Arg 3: variable value
 	frame->len = (p - frame->buf);
+
+	DEBUG(frame->worker, "Add action : set variable username=%.*s", (int) strlen(frame->username_password_pair), frame->username_password_pair);
+
+	*p++ = SPOE_ACT_T_SET_VAR; // Action type
+	*p++ = 3; // Number of args
+	*p++ = SPOE_SCOPE_SESS; // Arg 1: scope
+	spoe_encode_buffer("username", 8, &p, end); // Arg 2: variable name
+	*p++ = SPOE_DATA_T_STR;
+	spoe_encode_buffer(frame->username_password_pair, strlen(frame->username_password_pair), &p, end); // Arg 3: variable value
+	frame->len = (p - frame->buf);
+
+	free(frame->username_password_pair);
 
 	write_frame(NULL, frame);
 }
