@@ -7,9 +7,9 @@ LD = $(CC)
 
 CFLAGS  = -g -O2 -Wall -Werror -pthread
 INCS += -I./include
-LIBS = -lpthread -levent -levent_pthreads -lb64 -lpam
+LIBS = -lpthread -levent -levent_pthreads -lb64 -lpam -lhiredis
 
-OBJS = spoa.o base64.o pam.o
+OBJS = spoa.o base64.o pam.o redis.o
 
 
 spoa: $(OBJS)

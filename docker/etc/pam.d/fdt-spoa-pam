@@ -1,0 +1,1 @@
+auth    [success=ok default=die]	pam_radius_auth.so conf=/etc/pam_radius_auth.conf debug 

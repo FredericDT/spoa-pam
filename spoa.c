@@ -43,6 +43,9 @@
 #include <spoa_pam.h>
 #include <spoa_base64.h>
 
+#include <spoa_redis.h>
+#include <hiredis/hiredis.h>
+
 #include <security/pam_appl.h>
 
 #define DEFAULT_PORT       12345
@@ -105,6 +108,7 @@ struct spoe_frame {
 	int                  ip_score;   /* -1 if unset, else between 0 and 100 */
 	int                  header_valid;
 	int                  authenticated;
+	char                *username_password_pair;
 
 	struct event         process_frame_event;
 	struct worker       *worker;
@@ -174,6 +178,9 @@ static bool           debug            = false;
 static bool           pipelining       = false;
 static bool           async            = false;
 static bool           fragmentation    = false;
+static char           *redis_host      = NULL;
+static int            redis_port      = 6379;
+static char           *redis_pass      = NULL;
 
 
 static const char *spoe_frm_err_reasons[SPOE_FRM_ERRS] = {
@@ -215,9 +222,12 @@ check_authorization_header(struct spoe_frame *frame, struct chunk *auth_header)
 	char *b64_encoded_pair = auth_header->ptr + 6; // Skip "Basic "
 	char *username_password_pair = spoa_base64_decode(b64_encoded_pair);
 
-	DEBUG(frame->worker, "Decuded Basic Auth: %.*s", (int) strlen(username_password_pair), username_password_pair);
+	char *username_password_pair_not_split = strdup(username_password_pair);
+
+	DEBUG(frame->worker, "Decoded Basic Auth: %.*s", (int) strlen(username_password_pair), username_password_pair);
 
 	char *t = username_password_pair;
+	frame->username_password_pair = username_password_pair;
 	char *username = username_password_pair;
 	char *password = NULL;
 	while (*t != '\0') {
@@ -234,14 +244,28 @@ check_authorization_header(struct spoe_frame *frame, struct chunk *auth_header)
 
 	DEBUG(frame->worker, "Username: %.*s", (int) username_len, username);
 	DEBUG(frame->worker, "Password: %.*s", (int) password_len, password);
+	DEBUG(frame->worker, "username_password_pair_not_split: %.*s", (int) strlen(username_password_pair_not_split), username_password_pair_not_split);
 
-	int pam_retval = authenticate_system(username, password);
-	
-	frame->authenticated = (pam_retval == PAM_SUCCESS);
+	redisContext *redis_context;
+	init_redis_context(&redis_context, redis_host, redis_port, redis_pass);
+
+	if (spoa_redis_check(redis_context, username_password_pair_not_split)) {
+		frame->authenticated = 1;
+		
+		DEBUG(frame->worker, "redis check success");
+	} else {
+		int pam_retval = authenticate_system(username, password);
+		
+		frame->authenticated = (pam_retval == PAM_SUCCESS);
+		if (frame->authenticated) {
+			spoa_redis_update(redis_context, username_password_pair_not_split);
+			DEBUG(frame->worker, "redis update success");
+		}
+	}
+	free_redis_context(redis_context);
+	free(username_password_pair_not_split);
 
 	DEBUG(frame->worker, "authenticated: %u", frame->authenticated);
-
-	free(username_password_pair);
 }
 
 // static void
@@ -1476,6 +1500,25 @@ process_frame_cb(evutil_socket_t fd, short events, void *arg)
 	encode_varint(frame->authenticated, &p, end); // Arg 3: variable value
 	frame->len = (p - frame->buf);
 
+	// no setting variable "username" when datatype is invalid
+	if (frame->username_password_pair != NULL) {
+
+		int username_len = strlen(frame->username_password_pair);
+
+		DEBUG(frame->worker, "Add action : set variable username=%.*s", username_len, frame->username_password_pair);
+
+		*p++ = SPOE_ACT_T_SET_VAR; // Action type
+		*p++ = 3; // Number of args
+		*p++ = SPOE_SCOPE_SESS; // Arg 1: scope
+		spoe_encode_buffer("username", 8, &p, end); // Arg 2: variable name
+		*p++ = SPOE_DATA_T_STR;
+		spoe_encode_buffer(frame->username_password_pair, username_len, &p, end);
+		// encode_varint(frame->username_password_pair, &p, end); // Arg 3: variable value
+		frame->len = (p - frame->buf);
+
+		free(frame->username_password_pair);
+	}
+
 	write_frame(NULL, frame);
 }
 
@@ -1836,6 +1879,10 @@ main(int argc, char **argv)
 	struct event_base *base = NULL;
 	struct event      *signal_event = NULL, *accept_event = NULL;
 	int                opt, i, fd = -1;
+
+	redis_host = getenv("FDT_SPOA_REDIS_HOST");
+	redis_pass = getenv("FDT_SPOA_REDIS_PASS");
+	redis_port = (int) (strtol(getenv("FDT_SPOA_REDIS_PORT"), NULL , 10) & 0xFFFF);
 
 	// TODO: add '-t <processing-time>' option
 	while ((opt = getopt(argc, argv, "hdm:n:p:c:t:")) != -1) {

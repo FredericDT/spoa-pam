@@ -1,0 +1,67 @@
+version: '2.1'
+services:
+  haproxy-lb:
+    image: library/haproxy:2.2.9
+    restart: unless-stopped
+    networks:
+      internal:
+    volumes:
+      - ./etc/haproxy/haproxy-lb.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    ports:
+      - 12443:12443
+  haproxy-terminal:
+    image: library/haproxy:2.2.9
+    restart: unless-stopped
+    networks:
+      internal:
+      internal_proxy:
+    volumes:
+      - ./etc/haproxy/haproxy-terminal.cfg:/usr/local/etc/haproxy/haproxy.cfg
+      - ./etc/haproxy/spoe-pam.conf:/etc/haproxy/spoe-pam.conf
+      - /etc/ssl/private/byr-https-proxy.bupt.cn.pem:/etc/ssl/private/byr-https-proxy.bupt.cn.pem 
+      # - tls
+  privoxy:
+    image: vimagick/privoxy@sha256:34658a6b609d4fc9b1c9dfc467c6ad4ec94a5fc29a24fb24c614dd1fec1d2486
+    restart: unless-stopped
+    networks: # sequence is vital
+      internal_proxy:
+      proxy:
+  spoa:
+    image: ifdt/spoa-pam:v1
+    environment:
+      - FDT_SPOA_REDIS_HOST=redis
+      - FDT_SPOA_REDIS_PORT=6379
+      - FDT_SPOA_PAM_RADIUS_HOST=${RADIUS_HOST}
+      - FDT_SPOA_PAM_RADIUS_SHARED_SECRET=${RADIUS_SHARED_SECRET}
+      - FDT_SPOA_PAM_RADIUS_TIMEOUT=3
+    restart: unless-stopped
+    networks:
+      internal:
+  redis:
+    image: library/redis:6.0.16-bullseye
+    restart: unless-stopped
+    networks:
+      internal:
+networks:
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.134.0/24
+  internal_proxy:
+    internal: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.215.0/24
+  proxy:
+    driver: bridge
+    enable_ipv6: true
+    driver_opts:
+      com.docker.network.enable_ipv6: "true"
+      com.docker.network.bridge.enable_ip_masquerade: 'false'
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.38.34.0/24
+        - subnet: 2001:da8:215:5f02::/64
